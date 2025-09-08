@@ -1,0 +1,381 @@
+name: GitHub Account Backup with Gickup
+
+on:
+  # Run weekly on Sunday at 2:00 AM UTC
+  schedule:
+    - cron: '0 2 * * 0'
+
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      include_forks:
+        description: 'Include forked repositories'
+        required: false
+        default: false
+        type: boolean
+      include_starred:
+        description: 'Include starred repositories'
+        required: false
+        default: false
+        type: boolean
+      exclude_archived:
+        description: 'Exclude archived repositories'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  GICKUP_VERSION: "0.10.39"
+  BACKUP_NAME: "github-account-backup"
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Create backup directory
+      run: |
+        TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+        BACKUP_DIR="backup_${TIMESTAMP}"
+        echo "BACKUP_DIR=${BACKUP_DIR}" >> $GITHUB_ENV
+        echo "BACKUP_TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+        mkdir -p "${BACKUP_DIR}"
+
+    - name: Download and install Gickup
+      run: |
+        wget -O gickup.tar.gz "https://github.com/cooperspencer/gickup/releases/download/v${GICKUP_VERSION}/gickup_${GICKUP_VERSION}_linux_amd64.tar.gz"
+        tar -xzf gickup.tar.gz
+        chmod +x gickup
+        sudo mv gickup /usr/local/bin/
+        gickup --version
+
+    - name: Generate Gickup configuration
+      run: |
+        cat > gickup_config.yml << EOF
+        # GitHub Account backup configuration
+        source:
+          github:
+            - token: ${{ secrets.GIT_PAT_TOKEN }}
+              ssh: false
+              wiki: true
+              issues: true
+              starred: ${{ github.event.inputs.include_starred || 'false' }}
+              filter:
+                excludeforks: ${{ github.event.inputs.include_forks != 'true' }}
+                excludearchived: ${{ github.event.inputs.exclude_archived == 'true' }}
+
+        destination:
+          local:
+            - path: ${{ env.BACKUP_DIR }}/repositories
+              structured: true
+              bare: true
+              lfs: true
+
+        log:
+          file-logging:
+            dir: ${{ env.BACKUP_DIR }}
+            file: gickup.log
+            maxage: 30
+        EOF
+
+        echo "Generated Gickup configuration:"
+        cat gickup_config.yml
+
+    - name: Run backup with Gickup
+      run: |
+        echo "Starting backup with Gickup..."
+        gickup gickup_config.yml
+        echo "Gickup backup completed!"
+
+    - name: Generate backup metadata
+      run: |
+        ACCOUNT_INFO=$(curl -s -H "Authorization: token ${{ secrets.GIT_PAT_TOKEN }}" https://api.github.com/user)
+        REPO_COUNT=$(find ${{ env.BACKUP_DIR }}/repositories -maxdepth 2 -name "*.git" -type d | wc -l)
+        BACKUP_SIZE=$(du -sh ${{ env.BACKUP_DIR }} | cut -f1)
+
+        cat > ${{ env.BACKUP_DIR }}/backup_metadata.json << EOF
+        {
+          "backup_info": {
+            "timestamp": "${{ env.BACKUP_TIMESTAMP }}",
+            "date": "$(date -u +"%Y-%m-%d %H:%M:%S UTC")",
+            "tool": "gickup",
+            "version": "${GICKUP_VERSION}",
+            "backup_size": "${BACKUP_SIZE}",
+            "repository_count": ${REPO_COUNT}
+          },
+          "github_account": ${ACCOUNT_INFO},
+          "backup_options": {
+            "include_forks": ${{ github.event.inputs.include_forks || false }},
+            "include_starred": ${{ github.event.inputs.include_starred || false }},
+            "exclude_archived": ${{ github.event.inputs.exclude_archived || true }},
+            "include_wiki": true,
+            "include_issues": true,
+            "lfs_enabled": true,
+            "bare_repositories": true
+          }
+        }
+        EOF
+
+        # Cập nhật ENV để dùng về sau
+        echo "REPO_COUNT=${REPO_COUNT}" >> $GITHUB_ENV
+        echo "BACKUP_SIZE=${BACKUP_SIZE}" >> $GITHUB_ENV
+
+        # Cập nhật hướng dẫn khôi phục (mô tả nén theo repo)
+        cat > ${{ env.BACKUP_DIR }}/RESTORE_INSTRUCTIONS.md << 'EOF'
+        # Gickup Backup Restore Instructions (Per-Repo ZIP)
+
+        Mỗi repository được nén thành một file .zip (có mật khẩu).
+
+        ## Cấu trúc
+        backup_TIMESTAMP/
+        ├── repositories/
+        │   └── github.com/USERNAME/REPO.git
+        ├── backup_metadata.json
+        ├── gickup.log
+        └── (các file ZIP nằm ngoài thư mục backup_TIMESTAMP hoặc trong thư mục archives/)
+
+        ## Khôi phục một repo
+        unzip -P <password> github-account-backup_REPO_TIMESTAMP.zip
+        # Sau khi giải nén bạn sẽ có thư mục .git (bare):
+        git clone path/to/extracted/REPO.git REPO
+        cd REPO
+
+        ## Mirror lên remote mới
+        cd path/to/extracted/REPO.git
+        git push --mirror https://NEW_REMOTE_URL/REPO.git
+        EOF
+
+    # === BẮT ĐẦU PHẦN MỚI: NÉN MỖI REPO THÀNH 1 ZIP ===
+    - name: Create per-repo password-protected archives  # NEW
+      run: |
+        set -euo pipefail
+        mkdir -p archives
+        ROOT="${{ env.BACKUP_DIR }}/repositories"
+
+        # Liệt kê tất cả repo .git (bare) trong layout structured
+        mapfile -t REPOS < <(find "$ROOT" -type d -name "*.git" -printf "%p\n")
+
+        TOTAL_ARCHIVE_SIZE=0
+        MANIFEST=()
+
+        for repo in "${REPOS[@]}"; do
+          # Lấy tên repo: .../github.com/USERNAME/REPO.git -> REPO
+          REPO_DIRNAME="$(basename "$repo")"
+          REPO_NAME="${REPO_DIRNAME%.git}"
+          ZIP_NAME="${{ env.BACKUP_NAME }}_${REPO_NAME}_${{ env.BACKUP_TIMESTAMP }}.zip"
+
+          echo "Zipping $REPO_NAME -> archives/$ZIP_NAME"
+          # Zip có mật khẩu; nén cả thư mục .git (bare)
+          (cd "$(dirname "$repo")" && zip -r -q -P "${{ secrets.BACKUP_PASSWORD }}" "$GITHUB_WORKSPACE/archives/$ZIP_NAME" "$REPO_DIRNAME")
+
+          # Tính size file zip
+          SIZE=$(stat -f%z "archives/$ZIP_NAME" 2>/dev/null || stat -c%s "archives/$ZIP_NAME")
+          TOTAL_ARCHIVE_SIZE=$((TOTAL_ARCHIVE_SIZE + SIZE))
+
+          # Ghi vào manifest entry (định dạng JSON line)
+          MANIFEST+=( "{\"file\":\"$ZIP_NAME\",\"bytes\":$SIZE,\"repo\":\"$REPO_NAME\"}" )
+        done
+
+        echo "TOTAL_ARCHIVE_SIZE=${TOTAL_ARCHIVE_SIZE}" >> $GITHUB_ENV
+
+        # Tạo MANIFEST.json
+        {
+          echo "{"
+          echo "  \"timestamp\": \"${{ env.BACKUP_TIMESTAMP }}\","
+          echo "  \"account\": \"${{ github.actor }}\","
+          echo "  \"count\": ${#REPOS[@]},"
+          echo "  \"total_archive_bytes\": ${TOTAL_ARCHIVE_SIZE},"
+          echo "  \"files\": ["
+          for i in "${!MANIFEST[@]}"; do
+            if [ "$i" -gt 0 ]; then echo ","; fi
+            echo "    ${MANIFEST[$i]}"
+          done
+          echo ""
+          echo "  ]"
+          echo "}"
+        } > archives/MANIFEST.json
+
+        ls -lh archives/
+
+    - name: Configure S3 credentials
+      run: |
+        mkdir -p ~/.aws
+        cat > ~/.aws/credentials << EOF
+        [default]
+        aws_access_key_id = ${{ secrets.S3_ACCESS_KEY }}
+        aws_secret_access_key = ${{ secrets.S3_SECRET_KEY }}
+        EOF
+
+        cat > ~/.aws/config << EOF
+        [default]
+        region = ${{ secrets.S3_REGION || 'us-east-1' }}
+        EOF
+
+    - name: Install and configure AWS CLI
+      run: |
+        if command -v aws &> /dev/null; then
+          echo "AWS CLI already installed:"
+          aws --version
+        else
+          echo "Installing AWS CLI..."
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
+        fi
+
+    - name: Upload per-repo zips to S3  # NEW
+      run: |
+        set -euo pipefail
+        ACCOUNT_NAME=$(echo "${{ github.actor }}" | tr '[:upper:]' '[:lower:]')
+        S3_PATH="${{ secrets.S3_BUCKET }}/${{ secrets.S3_PREFIX || 'gickup-backups' }}/${ACCOUNT_NAME}/$(date +%Y)/$(date +%m)/${{ env.BACKUP_TIMESTAMP }}/"
+        echo "Uploading to: s3://${S3_PATH}"
+
+        ENDPOINT_URL="${{ secrets.S3_ENDPOINT }}"
+        if [[ ! "$ENDPOINT_URL" =~ ^https?:// ]]; then
+          ENDPOINT_URL="https://${ENDPOINT_URL}"
+          echo "Added https:// to endpoint: ${ENDPOINT_URL}"
+        fi
+
+        # Upload từng file để set metadata theo repo
+        shopt -s nullglob
+        for z in archives/*.zip; do
+          BN="$(basename "$z")"
+          # Trích repo từ tên file: backupname_REPO_timestamp.zip
+          REPO="${BN#${{ env.BACKUP_NAME }}_}"; REPO="${REPO%_${{ env.BACKUP_TIMESTAMP }}.zip}"
+          echo "Uploading $BN ..."
+          aws s3 cp "$z" "s3://${S3_PATH}" \
+            --endpoint-url="${ENDPOINT_URL}" \
+            --storage-class="${{ secrets.S3_STORAGE_CLASS || 'STANDARD' }}" \
+            --metadata "backup-tool=gickup,backup-date=${{ env.BACKUP_TIMESTAMP }},repo=${REPO}"
+        done
+
+        # Upload kèm MANIFEST & metadata tổng hợp
+        aws s3 cp "archives/MANIFEST.json" "s3://${S3_PATH}" \
+          --endpoint-url="${ENDPOINT_URL}" \
+          --storage-class="${{ secrets.S3_STORAGE_CLASS || 'STANDARD' }}" \
+          --metadata "type=manifest,backup-date=${{ env.BACKUP_TIMESTAMP }},repo-count=${{ env.REPO_COUNT }}"
+
+        echo "S3_URL_BASE=s3://${S3_PATH}" >> $GITHUB_ENV
+
+    - name: Verify upload and list S3 objects  # NEW
+      run: |
+        ENDPOINT_URL="${{ secrets.S3_ENDPOINT }}"
+        if [[ ! "$ENDPOINT_URL" =~ ^https?:// ]]; then
+          ENDPOINT_URL="https://${ENDPOINT_URL}"
+        fi
+        aws s3 ls "${{ env.S3_URL_BASE }}" --recursive --human-readable --summarize \
+          --endpoint-url="${ENDPOINT_URL}"
+
+        echo "✅ All per-repo archives uploaded to: ${{ env.S3_URL_BASE }}"
+
+    - name: Generate detailed backup summary (per-repo)  # UPDATED
+      run: |
+        # Chuyển tổng size bytes sang dạng đọc được
+        BYTES=${{ env.TOTAL_ARCHIVE_SIZE }}
+        if command -v numfmt >/dev/null 2>&1; then
+          HUMAN=$(numfmt --to=iec ${BYTES})
+        else
+          HUMAN="${BYTES}B"
+        fi
+
+        # Liệt kê top 10 file lớn nhất
+        (cd archives && ls -lS *.zip 2>/dev/null | head -10 > ../top10.txt || true)
+
+        cat > backup_summary.md << EOF
+        # GitHub Account Backup Summary (Gickup) — Per-Repo Archives
+
+        ## 📋 Backup Information
+        - **Account:** ${{ github.actor }}
+        - **Backup Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        - **Tool Used:** Gickup v${GICKUP_VERSION}
+        - **Backup ID:** ${{ env.BACKUP_TIMESTAMP }}
+
+        ## 📊 Statistics
+        - **Repositories Backed Up:** ${{ env.REPO_COUNT }}
+        - **Backup Folder Size (raw):** ${{ env.BACKUP_SIZE }}
+        - **Total Archive Size (sum of zips):** ${HUMAN}
+
+        ## 🗄️ Storage Information
+        - **S3 Location (prefix):** ${{ env.S3_URL_BASE }}
+        - **Password Protected:** ✅ Yes
+        - **Storage Class:** ${{ secrets.S3_STORAGE_CLASS || 'STANDARD' }}
+
+        ## 🧾 Files
+        - **Manifest:** \`MANIFEST.json\` (đã upload lên S3)
+        - **Per-repo zips:** \`${{ env.BACKUP_NAME }}_<REPO>_${{ env.BACKUP_TIMESTAMP }}.zip\`
+
+        ## 🔝 Top 10 largest archives
+        \`\`\`
+        $(cat top10.txt 2>/dev/null || echo "N/A")
+        \`\`\`
+
+        ## 🔄 Restore Options
+        1. **Individual Repository:** unzip file tương ứng bằng mật khẩu rồi \`git clone\` từ repo bare.
+        2. **Mirror:** \`git push --mirror\` từ repo bare đã giải nén lên remote mới.
+        3. **Bulk:** dùng MANIFEST.json để script hóa quá trình giải nén & khôi phục hàng loạt.
+
+        ---
+        *Backup created with ❤️ using Gickup — per-repo encrypted archives*
+        EOF
+
+    - name: Upload summary & manifest as artifacts  # UPDATED
+      uses: actions/upload-artifact@v4
+      with:
+        name: gickup-backup-summary-${{ env.BACKUP_TIMESTAMP }}
+        path: |
+          backup_summary.md
+          archives/MANIFEST.json
+        retention-days: 90
+
+    - name: Analyze backup log for insights
+      run: |
+        if [ -f "${{ env.BACKUP_DIR }}/gickup.log" ]; then
+          echo "📋 Backup Log Summary:"
+          echo "=================="
+          SUCCESSFUL=$(grep -c "successfully backed up" "${{ env.BACKUP_DIR }}/gickup.log" || echo "0")
+          echo "✅ Successful backups: ${SUCCESSFUL}"
+          ERRORS=$(grep -c "error\|failed" "${{ env.BACKUP_DIR }}/gickup.log" || echo "0")
+          echo "❌ Errors encountered: ${ERRORS}"
+          if [ "${ERRORS}" -gt 0 ]; then
+            echo ""
+            echo "🔍 Error Details:"
+            grep -i "error\|failed" "${{ env.BACKUP_DIR }}/gickup.log" | head -5
+          fi
+          echo ""
+          echo "📊 Log file is included in backup directory"
+        fi
+
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf ${{ env.BACKUP_DIR }}/ || true
+        rm -f gickup_config.yml || true
+        rm -f gickup.tar.gz || true
+        rm -f awscliv2.zip || true
+        rm -rf aws/ || true
+        rm -rf ~/.aws/ || true
+
+    - name: Final status
+      run: |
+        echo ""
+        echo "🎉 GitHub Account Backup completed (Per-Repo ZIP)!"
+        echo "=================================================="
+        echo "📍 S3 Prefix: ${{ env.S3_URL_BASE }}"
+        echo "📊 Repositories: ${{ env.REPO_COUNT }}"
+        echo "💾 Total ZIP Size: $(numfmt --to=iec ${{ env.TOTAL_ARCHIVE_SIZE }})"
+        echo "🛡️  Security: Password protected (per-repo)"
+        echo "🔧 Tool: Gickup v${GICKUP_VERSION}"
+        echo ""
+        echo "✅ Your GitHub account has been safely backed up (individual archives)!"
+
+    - name: Failure notification
+      if: failure()
+      run: |
+        echo "❌ Backup process failed!"
+        echo "Please check the workflow logs for details."
+        echo "Common issues include:"
+        echo "- Invalid or insufficient PAT token permissions"
+        echo "- S3 credentials or endpoint configuration"
+        echo "- Network connectivity issues"
+        echo "- Insufficient storage space"
